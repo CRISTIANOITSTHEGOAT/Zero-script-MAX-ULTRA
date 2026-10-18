@@ -1,0 +1,54 @@
+2026-10-13 09:58:01 ===== BRIDGE START  v1.6.0  pid=4168  log=C:\Users\alcos\Downloads\Zero-scrpt-ULTRA-main\Zero-scrpt-ULTRA-main\ZeroScript-Free-1.5.5\logs\bridge_debug.log =====
+2026-10-13 09:58:01 Dev Kit ready: 8 bridge-side commands (data dir: C:\Users\alcos\Downloads\Zero-scrpt-ULTRA-main\Zero-scrpt-ULTRA-main\ZeroScript-Free-1.5.5\.zeroscript)
+2026-10-13 09:58:01 configured 1 MCP server(s): roblox
+2026-10-13 09:58:01 listening on ws://127.0.0.1:17613  - load the extension and open a supported AI chat
+2026-10-13 09:58:01 [roblox] launching  (C:\Users\alcos\AppData\Local\Python\pythoncore-3.14-64\python.exe C:\Users\alcos\Downloads\Zero-scrpt-ULTRA-main\Zero-scrpt-ULTRA-main\ZeroScript-Free-1.5.5\launch_studio_mcp.py)
+2026-10-13 09:58:01 [roblox] stderr: launch_studio_mcp: using C:\Users\alcos\AppData\Local\Roblox\Versions\version-9b554450a0fc4e65\StudioMCP.exe
+2026-10-13 09:58:01 [roblox] MCP server up  (30 tools advertised)
+2026-10-13 09:58:08 extension connected  (127.0.0.1)  [1 client(s)]
+2026-10-13 09:58:09     30 Roblox tools loaded, but NO Roblox Studio is connected yet.
+2026-10-13 09:58:09     (This can be a slow attach that clears itself within ~10-15s -
+2026-10-13 09:58:09     watch for a green 'Roblox Studio connected' line right after.)
+2026-10-13 09:58:09 ACTION NEEDED: Open your place in Roblox Studio. | Go to: Assistant Settings > MCP Servers |        > 'Enable Studio as MCP server' | It can take up to ~10s; this window will turn green.
+2026-10-13 09:58:09     (8 Dev Kit commands are live already - luau_check and script_history need no Studio)
+2026-10-13 09:58:33 Roblox Studio connected - 30 tools ready.
+2026-10-13 09:58:35 Place loaded in Studio.
+2026-10-13 10:00:31 -> tool  project_overview()
+2026-10-13 10:00:31 <- project_overview (0.1s): project_overview: "Place1" (Edit mode) - 401 instances listed, 0 scripts, in 0.1
+2026-10-13 10:02:20 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:02:20 <- execute_luau (0.1s): ShopGui built: 6 items, 5 categories
+2026-10-13 10:02:27 -> tool  studio_view(select)
+2026-10-13 10:02:27 <- studio_view (0.0s): studio_view: selected 1: StarterGui.ShopGui.Main
+2026-10-13 10:03:27 Roblox Studio disconnected - re-enable its MCP server (toggle off/on).
+2026-10-13 10:03:28 Place closed (Studio app still connected).
+2026-10-13 10:03:40 Roblox Studio connected - 30 tools ready.
+2026-10-13 10:03:41 Place loaded in Studio.
+2026-10-13 10:05:24 -> tool  project_overview()
+2026-10-13 10:05:24 <- project_overview (0.1s): project_overview: "Place1" (Edit mode) - 401 instances listed, 0 scripts, in 0.0
+2026-10-13 10:05:46 -> tool  search_game_tree(datamodel_type, keywords, instance_type)
+2026-10-13 10:05:47 <- search_game_tree (0.0s): [{"name":"Tunnel1","className":"Model","unexploredChildCount":1,"childSummary":"
+2026-10-13 10:05:55 -> tool  inspect_instance(path)
+2026-10-13 10:05:55 <- inspect_instance (0.0s): {"path":"Workspace.Tunnel.Tunnel1","name":"Tunnel1","className":"Model","uniqueI
+2026-10-13 10:05:55 -> tool  inspect_instance(path)
+2026-10-13 10:05:55 <- inspect_instance (0.0s): {"path":"Workspace.Tunnel.Tunnel2","name":"Tunnel2","className":"Model","uniqueI
+2026-10-13 10:06:05 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:06:05 <- execute_luau (0.0s): {"t1_size":[19.063861846923829,26.29290199279785,2.2263998985290529],"t2_size":[
+2026-10-13 10:06:50 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:06:50 <- execute_luau (0.0s): {"t2_ray_pos":[43.619998931884769,18.09274673461914,71.52999877929688],"mid_hit_
+2026-10-13 10:06:58 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:06:58 <- execute_luau (0.0s): {"hit1_y":0.22619247436523438,"hit1_inst":"Workspace.Road.Part","hit2_inst":"Wor
+2026-10-13 10:09:04 -> tool  multi_edit(className, datamodel_type, edits, file_path)
+2026-10-13 10:09:04 <- multi_edit (0.1s): Created Memory (ModuleScript) with 1 edits applied
+2026-10-13 10:12:10 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:12:12 <- execute_luau (1.3s): {"rigType":"R15","modelName":"Player","hasHRP":true,"hasHumanoid":true}
+2026-10-13 10:18:10 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:18:11 <- execute_luau (0.8s): {"count":0}
+2026-10-13 10:26:32 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:26:34 <- execute_luau (1.6s): {"u261":{"id":261,"first":{"Id":4371992339,"IsOnline":false,"Username":"JoeysFau
+2026-10-13 10:26:43 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:26:44 <- execute_luau (1.6s): [{"name":"Head","className":"Part"},{"name":"Torso","className":"Part"},{"name":
+2026-10-13 10:26:56 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:26:58 <- execute_luau (1.6s): {"r6_walk":"http://www.roblox.com/asset/?id=180426354","r15_walk":"http://www.ro
+2026-10-13 10:43:20 -> tool  execute_luau(code, datamodel_type)
+2026-10-13 10:43:22 <- execute_luau (1.2s): [{"class":"StringValue","name":"idle","children":[{"id":"http://www.roblox.com/a
+2026-10-13 10:43:33 [roblox] stdout closed (process ended, exit code None)
