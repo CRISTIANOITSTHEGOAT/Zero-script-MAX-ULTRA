@@ -109,6 +109,7 @@
     { name: "GLM", url: "https://chat.z.ai/" },
     { name: "Qwen", url: "https://chat.qwen.ai/" },
     { name: "Arena", url: "https://arena.ai/text/direct" },
+    { name: "LM Arena", url: "https://lmarena.ai/c/new?mode=direct" },
     { name: "Meta AI", url: "https://www.meta.ai/" },
   ];
 
@@ -186,11 +187,69 @@
     toolsAt: 0,
   };
 
+  // ── FAST WAITS (no dead time) ─────────────────────────────────────────────
+  // The agent loop used to sit in flat sleeps between every DOM read: 120ms in
+  // waitFor, 160-250ms in the response watcher. A reply that finished in the
+  // meantime was therefore noticed up to 250ms late, and every tool result
+  // inherited that dead time - it added up to seconds per turn, on top of the
+  // model's own thinking time.
+  //
+  // waitTick() is the replacement: it waits for the NEXT DOM CHANGE, not for a
+  // fixed delay. The chat page mutates on every streamed token, so the watcher
+  // wakes up within a frame of the last change instead of waiting out a timer
+  // it could have skipped. The timer is still there as a ceiling (a page that
+  // stops mutating must not hang the loop) and a small minimum gap keeps a
+  // chatty page from turning the watcher into a busy loop.
+  const TICK_MIN_GAP_MS = 25;
+  function waitTick(ms, minGap = TICK_MIN_GAP_MS) {
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      let mo = null, timer = null, done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        try { if (mo) mo.disconnect(); } catch {}
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      timer = setTimeout(finish, Math.max(0, ms));
+      try {
+        mo = new MutationObserver(() => {
+          const wait = Math.max(0, minGap - (Date.now() - t0));
+          if (wait) setTimeout(finish, wait); else finish();
+        });
+        const root = document.body || document.documentElement;
+        if (root) mo.observe(root, { childList: true, subtree: true, characterData: true });
+        else finish();
+      } catch {
+        finish();
+      }
+    });
+  }
+
+  // Wait for the next PAINT, not for a timer: two frames is the cheapest way
+  // to know the browser has laid the page out again after we touched it.
+  function nextPaint() {
+    return new Promise((resolve) => {
+      let raf = 0;
+      const go = () => {
+        if (raf) cancelAnimationFrame(raf);
+        raf = requestAnimationFrame(() => { raf = requestAnimationFrame(() => resolve()); });
+      };
+      go();
+      // A backgrounded tab never paints - fall back to a timer so a parked
+      // loop can still make progress (and so this can never hang).
+      setTimeout(resolve, 120);
+    });
+  }
+
   async function waitFor(pred, timeout) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeout) {
       if (pred()) return true;
-      await sleep(120);
+      const left = timeout - (Date.now() - t0);
+      if (left <= 0) break;
+      await waitTick(Math.min(120, left));
     }
     return false;
   }
@@ -244,8 +303,10 @@
     const parked = Date.now() - t0;
     diag("park.resumed", { parkedMs: parked });
     // Give the site a beat to repaint: a tab that was hidden has no layout, so
-    // the first reads after unhide can come back stale/blank.
-    if (!A.stop) await sleep(400);
+    // the first reads after unhide can come back stale/blank. A PAINT is the
+    // signal for that (the old flat 400ms sleep was pure dead time on every
+    // tab switch back to the AI).
+    if (!A.stop) await nextPaint();
     return parked;
   }
 
@@ -267,16 +328,26 @@
     A.injecting = true;
     ui.inputCover(true);
     try {
-      // Quick 2-point settle: sample the previous response's stream length before
-      // and after a 200ms yield. A one-shot React batch flush (the common case)
-      // shows no second growth and costs only 200ms. A genuinely still-generating
-      // stream shows growth → fall back to the full idle wait.
+      // Quick 2-point settle: sample the previous response's stream length, let
+      // the site flush ONE paint, and sample again. A one-shot React batch
+      // flush (the common case) shows no second growth, and a paint is the
+      // earliest moment that flush can be observed - so this costs a couple of
+      // frames instead of the flat 200ms it used to. A genuinely still-
+      // generating stream shows growth (or the provider still reports "busy")
+      // → fall back to the full idle wait, which is also what keeps a tool
+      // result from being injected into a reply that is still being written.
       const _settleItem = P.lastAssistant();
       const _settleLen0 = _settleItem ? P.streamLen(_settleItem) : 0;
-      await sleep(200);
-      if (_settleItem && _settleItem === P.lastAssistant() &&
-          P.streamLen(_settleItem) > _settleLen0) {
-        await waitFor(() => !P.isGenerating(), 4000);
+      await nextPaint();
+      const _grew = _settleItem && _settleItem === P.lastAssistant() &&
+        P.streamLen(_settleItem) > _settleLen0;
+      // isBusyNow() is the STRICT "is a generation happening RIGHT NOW" gate
+      // (a visible stop button, a spinner); isGenerating() also LINGERS for a
+      // moment after the answer ends, so it must not decide whether to wait -
+      // only whether the generation is over.
+      const _busy = typeof P.isBusyNow === "function" ? P.isBusyNow() : P.isGenerating();
+      if (_grew || _busy) {
+        await waitFor(() => !P.isGenerating(), 2500);
       }
       const base = P.assistantCount();
       const preUser = P.userCount();
@@ -402,6 +473,12 @@
     const WARMUP_MS = T.WARMUP_MS;
     const REASON_NOREPLY_MS = T.REASON_NOREPLY_MS;
     const NO_TURN_GRACE_MS = 30000;
+    // How long the DOM is given to settle after the reply stopped changing.
+    // Provider-tunable (a site that re-renders in several steps can ask for
+    // more), but the default is a quarter of the old flat 500ms: the watcher
+    // now wakes on DOM changes, so the wait only has to cover the tail of the
+    // final render - not a whole poll interval of dead time.
+    const SETTLE_MS = T.SETTLE_MS || 250;
     // Upper bound on holding off a parse verdict while a provider reports its
     // read is unsettled (Qwen A/B dual turn still landing). A genuinely stuck
     // read still resolves after this and is parsed as-is.
@@ -489,7 +566,7 @@
           // on Qwen kept ending "empty" with a complete command in the net tap,
           // and without the branch name the cause was unfindable from the log.
           if (Date.now() - preStartSilent > 60000) { diag("empty.why", { branch: "preStart", rep: (d.reply||"").length }); return { kind: "empty" }; }
-          await sleep(200);
+          await waitTick(200);
           continue;
         }
       }
@@ -546,7 +623,7 @@
         // (effective) open-block reading is holding us.
         if (genOffFirstAt) { if (gen) waitedFlicker++; else if (effectiveBlock) waitedBlock++; }
         doneSince = 0;
-        await sleep(160);
+        await waitTick(160);
         continue;
       }
       if (stuckDone && gen) log("generating flag stuck - falling back to text stability");
@@ -575,15 +652,20 @@
             assistantCount: P.assistantCount ? P.assistantCount() : undefined,
             base, gen, started, replyLen: (d.reply || "").length });
         }
-        if (Date.now() - noTurnSince < NO_TURN_GRACE_MS) { await sleep(200); continue; }
+        if (Date.now() - noTurnSince < NO_TURN_GRACE_MS) { await waitTick(200); continue; }
       } else {
         noTurnSince = 0;
         A._noTurnLoggedAt = 0;
       }
 
       if (!doneSince) doneSince = Date.now();
-      if (Date.now() - doneSince < 500) {  // 500ms settle – DOM is stable
-        await sleep(120);
+      // Settle: the site may still be committing the final render. This used to
+      // be a flat 500ms; with the watcher now waking on DOM changes it only has
+      // to cover the gap between the last mutation and the read, so 250ms is
+      // plenty - and the blank-read fallback below covers a read that still
+      // lands on a re-render frame.
+      if (Date.now() - doneSince < SETTLE_MS) {
+        await waitTick(SETTLE_MS);
         continue;
       }
 
@@ -591,7 +673,7 @@
       // finalize it as empty/truncated/text (a premature retry interrupts it).
       if (!sawContent) {
         if (!warmSince) warmSince = Date.now();
-        if (Date.now() - warmSince < WARMUP_MS) { await sleep(200); continue; }
+        if (Date.now() - warmSince < WARMUP_MS) { await waitTick(200); continue; }
         diag("empty.why", { branch: "warmup", rep: (d.reply||"").length, lastGood: lastGoodReply.length });
         return { kind: "empty" };
       }
@@ -601,7 +683,7 @@
       // exempt so a real stop still ends.
       if (d.thinking && d.thinking.length && !(d.reply && d.reply.length) && !P.turnHalted(d.item)) {
         if (!reasonSince) reasonSince = Date.now();
-        if (Date.now() - reasonSince < REASON_NOREPLY_MS) { await sleep(200); continue; }
+        if (Date.now() - reasonSince < REASON_NOREPLY_MS) { await waitTick(200); continue; }
       } else {
         reasonSince = 0;
       }
@@ -631,7 +713,7 @@
       );
       if (cmdShaped && P.replyUnsettled(d.item)) {
         if (!unsettledSince) unsettledSince = Date.now();
-        if (Date.now() - unsettledSince < UNSETTLED_GRACE_MS) { await sleep(250); continue; }
+        if (Date.now() - unsettledSince < UNSETTLED_GRACE_MS) { await waitTick(250); continue; }
       } else {
         unsettledSince = 0;
       }
@@ -646,12 +728,12 @@
       // No-op for every provider except Qwen. RESPONSE_TIMEOUT still bounds a truly
       // stuck carousel, so this cannot hang.
       if (P.isComparisonTurn && P.isComparisonTurn(d.item)) {
-        if (P.isGenerating()) { await sleep(250); continue; }   // both still writing
+        if (P.isGenerating()) { await waitTick(250); continue; }   // both still writing
         if (P.resolveComparison && P.resolveComparison()) {
           diag("carousel.resolved");
-          await sleep(400); continue;                            // let it collapse, re-read
+          await waitTick(400); continue;                            // let it collapse, re-read
         }
-        await sleep(250); continue;                              // button not ready yet
+        await waitTick(250); continue;                              // button not ready yet
       }
       if (ZSParse.hasToolSignature(r)) {
         const calls = ZSParse.parseToolCalls(r);
@@ -1145,10 +1227,17 @@
   // continue_on_error for a batch of genuinely independent steps.
   //
   // 16, not 8: every reply is a full model turn (10-60s), so the cap is what
-  // decides how many turns a task costs. Steps still run ONE AT A TIME - the
-  // bridge locks each MCP server per call and Studio itself is single-threaded,
-  // so firing them concurrently would only queue them elsewhere while making a
-  // half-finished batch impossible to reason about.
+  // decides how many turns a task costs.
+  //
+  // READ-ONLY STEPS NOW RUN IN PARALLEL. A batch is mostly READS (project_
+  // overview, script_read, luau_check, workspace grep...), and each one is a
+  // full round trip to the bridge and back - 16 of them in a row was 16 round
+  // trips of pure waiting, which is exactly the "wasting time" a batch was
+  // supposed to remove. Read-only steps cannot change anything, so running
+  // them together is safe; anything that WRITES (script_write, multi_edit,
+  // execute_luau, workspace push, playtest) still runs one at a time, in
+  // order, so a write never races another write and the "stop at the first
+  // failure" rule still holds where it matters.
   const BATCH_MAX_STEPS = 16;
   const BATCH_STEP_CHARS = 6000;
   async function runBatch(args) {
@@ -1156,15 +1245,44 @@
     if (plan.error) return `ERROR: ${plan.error}`;
     const keepGoing = args.continue_on_error === true || args.continue_on_error === "true";
     const results = [];
-    for (const step of plan.steps) {
+    const steps = plan.steps;
+    let i = 0;
+    while (i < steps.length) {
       if (A.stop) break;
-      const bare = bareToolName(step.tool);
-      if (isBlockedTool(step.tool) || VISION_TOOLS.has(bare) || A.imageTools.has(bare)) {
-        results.push({ tool: step.tool, text: "not run: image and blocked commands cannot be used inside a batch.", isErr: true });
+      // A step that must not run inside a batch ends the whole batch (as
+      // before) - it is a mistake by the model, not a failure to continue past.
+      const blockedAt = steps.findIndex((s, n) => n >= i && (() => {
+        const bare = bareToolName(s.tool);
+        return isBlockedTool(s.tool) || VISION_TOOLS.has(bare) || A.imageTools.has(bare);
+      })());
+      if (blockedAt >= 0) {
+        results.push({ tool: steps[blockedAt].tool,
+                       text: "not run: image and blocked commands cannot be used inside a batch.", isErr: true });
         break;
       }
+      // Collect a run of CONSECUTIVE read-only steps - they cannot change
+      // anything, so they go out together instead of one round trip after the
+      // other. A write breaks the run and goes on its own, in order.
+      let j = i;
+      while (j < steps.length && ZS.isReadOnlyStep(steps[j]) && !A.stop) j++;
+      if (j > i) {
+        const group = steps.slice(i, j);
+        const outs = await Promise.all(group.map((s) => runTool({ tool: s.tool, arguments: s.arguments })));
+        for (let k = 0; k < group.length; k++) {
+          const out = outs[k] == null ? "(no result)" : String(outs[k]);
+          results.push({ tool: group[k].tool, text: stripOutputPrefix(out), isErr: feedbackIsError(out) });
+        }
+        i = j;
+        // A failure inside a parallel group ends the batch here (unless the
+        // model asked to continue) - but every step of the group already ran,
+        // so all of their results are reported.
+        if (!keepGoing && results.some((r) => r.isErr)) break;
+        continue;
+      }
+      const step = steps[i];
       const out = await runTool({ tool: step.tool, arguments: step.arguments });
       results.push({ tool: step.tool, text: stripOutputPrefix(out), isErr: feedbackIsError(out) });
+      i++;
       if (results[results.length - 1].isErr && !keepGoing) break;
     }
     diag("batch.done", { steps: plan.steps.length, ran: results.length, keepGoing });

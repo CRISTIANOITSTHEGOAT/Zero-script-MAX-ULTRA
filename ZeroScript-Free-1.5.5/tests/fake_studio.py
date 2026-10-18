@@ -33,7 +33,11 @@ PROTOCOL_VERSION = "ZS-DEVKIT-FAKE/1"
 
 KIND_RE = re.compile(r'zs_out\("([A-Z]+)"\)')
 PAYLOAD_RE = re.compile(r"zs_records\((\[=*\[)(.*?)(\]=*\])\)", re.S)
-SUB_RE = re.compile(r"local (MAX_DEPTH|MAX_NODES|MAX|WANT_SCRIPTS|WANT_TREE|FOCUS|wantSelect|wantClear) = (.+)")
+SUB_RE = re.compile(r"local (MAX_DEPTH|MAX_NODES|MAX|WANT_SCRIPTS|WANT_TREE|FOCUS|wantSelect|wantClear"
+                    r"|wantOld|oldBudget) = (.+)")
+# The set of paths a retried write must not capture again (the snippet skips
+# them so a second read cannot return the NEW source as if it were the old).
+SKIP_OLD_RE = re.compile(r"local skipOld = (\{.*\})")
 
 
 def parse_records(payload):
@@ -106,6 +110,7 @@ class FakeStudio:
         self.fail_source_write = False
         self.no_loadstring = False
         self.max_reply_bytes = 0   # 0 = unlimited
+        self.console_shape = None  # None = accept every argument spelling
         self.max_code_bytes = 0    # 0 = unlimited; over it, Luau "fails to parse"
         self.input_sent = []
         for path, (cls, src) in (scripts or {}).items():
@@ -181,7 +186,17 @@ class FakeStudio:
         return "Available DataModels: Edit%s" % (", Server, Client" if self.playing else "")
 
     def _get_console_output(self, a):
-        which = a.get("datamodel_type") or a.get("datamodel") or "Server"
+        # Knob: pretend this Studio build only knows ONE spelling of the
+        # argument. The other spellings answer with the complaint Studio
+        # really gives ("datamodel_type is not available"), so the Dev Kit
+        # has to try the next one - which is what the shape cache is for.
+        shape = getattr(self, "console_shape", None)
+        if shape:
+            if shape not in a:
+                return "datamodel_type is not available in this build"
+            which = a[shape]
+        else:
+            which = a.get("datamodel_type") or a.get("datamodel") or "Server"
         if which not in self.console and a:
             return ""
         return "\n".join(self.console.get(which.capitalize(), []))
@@ -348,7 +363,35 @@ class FakeStudio:
     def _zs_write(self, payload, subs, code):
         lines = [f"PLACE\t{self.place}"]
         selected = []
-        for rec in parse_records(payload):
+        recs = parse_records(payload)
+        # PHASE 1 - capture the previous source of every file that exists,
+        # BEFORE anything is written. This is what makes the undo snapshot
+        # free: it rides along with the write instead of costing a second
+        # Studio round trip ("read the old sources" before every write).
+        want_old = subs.get("wantOld") == "true"
+        budget = int(subs.get("oldBudget", "0") or 0)
+        skip_old = set()
+        m = SKIP_OLD_RE.search(code or "")
+        if m:
+            skip_old = set(re.findall(r'\["([^"]+)"\]', m.group(1)))
+        if want_old:
+            used = 0
+            for rec in recs:
+                path = self.norm(rec["path"])
+                if path in skip_old:
+                    continue
+                existing = self.scripts.get(path)
+                if not existing or existing["class"] not in LUA_SOURCE_CLASSES:
+                    continue
+                src = existing["source"].encode("utf-8")
+                if used + len(src) > budget:
+                    continue
+                used += len(src)
+                b64 = base64.b64encode(src).decode("ascii")
+                lines.append("OLD\t%s\tB64\t%d\t%d" % (rec["path"], len(src), len(b64)))
+                lines.append(b64)
+        # PHASE 2 - write.
+        for rec in recs:
             path = self.norm(rec["path"])
             for i in range(2, len(path.split("."))):
                 self.folders.add("game." + ".".join(path.split(".")[1:i]))

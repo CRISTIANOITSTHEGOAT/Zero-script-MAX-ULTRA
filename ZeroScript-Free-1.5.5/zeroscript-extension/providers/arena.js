@@ -71,6 +71,40 @@ const ZSProvider = (() => {
     busy: /something went wrong|une erreur s.est produite|try again later|réessayer plus tard|rate limit|too many requests/i,
   };
 
+  // ── Fast waits ───────────────────────────────────────────────────────────
+  // The provider used to poll with a flat sleep(120) between every check, so
+  // every wait (composer ready, message accepted, button enabled) cost up to
+  // 120ms of dead time - and the send path does several of them in a row.
+  // waitTick() wakes on the NEXT DOM CHANGE instead: Arena's React app mutates
+  // the moment the composer enables, the button re-renders or the message is
+  // accepted, so the check now runs the moment it can pass instead of up to
+  // 120ms later. The timer stays as a ceiling.
+  function waitTick(ms, minGap = 20) {
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      let mo = null, timer = null, done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        try { if (mo) mo.disconnect(); } catch {}
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      timer = setTimeout(finish, Math.max(0, ms));
+      try {
+        mo = new MutationObserver(() => {
+          const wait = Math.max(0, minGap - (Date.now() - t0));
+          if (wait) setTimeout(finish, wait); else finish();
+        });
+        const root = document.body || document.documentElement;
+        if (root) mo.observe(root, { childList: true, subtree: true, characterData: true });
+        else finish();
+      } catch {
+        finish();
+      }
+    });
+  }
+
   // Arena streams with a hard stop-button signal for the WHOLE generation, so
   // idle windows can be tight (mirrors Gemini, not DeepSeek's reasoning phase).
   const timings = {
@@ -80,6 +114,11 @@ const ZSProvider = (() => {
     REASON_NOREPLY_MS: 90000,
     STABLE_MS: 9000,
     RESPONSE_TIMEOUT_MS: 300000,
+    // How long the DOM is given to settle after the reply stopped changing.
+    // The core's watcher wakes on DOM changes, so this only has to cover the
+    // tail of the final render - the old flat 500ms was a full poll interval
+    // of dead time on every single turn.
+    SETTLE_MS: 220,
   };
 
   // ── Turn classification ───────────────────────────────────────────────────
@@ -263,10 +302,17 @@ const ZSProvider = (() => {
   }
 
   const chatIsEmpty = () => allItems().length === 0;
-  // A genuinely fresh chat: the /text/* route with the composer rendered and no
+  // A fresh chat has NO conversation id yet. arena.ai routes it as
+  // /text/<mode> (Direct, Battle, …); lmarena.ai - the same app under its old
+  // domain, still in a lot of bookmarks and old links - routes it as
+  // /c/new?mode=direct. A real conversation is /c/<uuid> on both, so only the
+  // two fresh shapes are treated as "no conversation yet".
+  const isFreshRoute = () =>
+    /^\/text\//.test(location.pathname) || /^\/c\/new(\/|$)/.test(location.pathname);
+  // A genuinely fresh chat: the fresh route with the composer rendered and no
   // turns. An existing conversation is /c/<id>, so it never gates.
   const isFreshChat = () =>
-    chatIsEmpty() && /^\/text\//.test(location.pathname) && !!getEditor();
+    chatIsEmpty() && isFreshRoute() && !!getEditor();
 
   // The whole composer the Start gate hides as one unit = the <form>.
   const composerFrame = () => {
@@ -341,15 +387,37 @@ const ZSProvider = (() => {
 
   const WEDGE_MS = 10000;
   let _stopSince = 0;
+  // The last moment the "Stop generation" button was seen. Arena shows that
+  // button for the WHOLE generation and swaps it back for the send button the
+  // instant the model stops - so the button DISAPPEARING is the site's own
+  // "the answer is finished" signal. Remembering when we last saw it lets the
+  // watcher end the turn at once instead of waiting out GEN_IDLE_MS (1.5s of
+  // dead time on EVERY turn, before the core's own settle).
+  let _stopSeenAt = 0;
+  // How long the button may be missing before we believe the turn is over.
+  // Long enough to cover a re-render that blinks the button out for a frame,
+  // short enough to be invisible next to the old 1.5s idle window.
+  const STOP_GONE_GRACE_MS = 60;
   function genActive() {
     sampleStream();
     const stop = !!stopButton();
     const now = Date.now();
     if (stop) {
       if (!_stopSince) _stopSince = now;
+      _stopSeenAt = now;
       return (now - _streamAt < WEDGE_MS) || (now - _stopSince < 2000);
     }
     _stopSince = 0;
+    if (_stopSeenAt && now - _stopSeenAt < 3000) {
+      // The button was there a moment ago and is gone now. Give it one beat
+      // (a re-render can blink it out for a frame) and then believe the site:
+      // the generation is over - UNLESS the text has grown since we last saw
+      // the button, which means the model is still writing.
+      if (now - _stopSeenAt < STOP_GONE_GRACE_MS) return true;
+      return _streamAt > _stopSeenAt;
+    }
+    // No button has been seen yet (the gap between "send clicked" and "Stop
+    // generation" mounted): the growth heuristic covers that window.
     return grewWithin(timings.GEN_IDLE_MS);
   }
   const isGenerating = genActive;
@@ -387,7 +455,9 @@ const ZSProvider = (() => {
     const t0 = Date.now();
     while (Date.now() - t0 < timeout) {
       if (pred()) return true;
-      await sleep(120);
+      const left = timeout - (Date.now() - t0);
+      if (left <= 0) break;
+      await waitTick(Math.min(120, left));
     }
     return false;
   }
@@ -428,6 +498,11 @@ const ZSProvider = (() => {
   async function typeAndSend(text, images) {
     const editor = getEditor();
     if (!editor) throw new Error("Arena input box not found");
+    // A NEW turn starts here: the "Stop generation" sighting belongs to the
+    // PREVIOUS turn, so forget it. Otherwise the next turn's pre-stream window
+    // (before the button mounts) would be judged by the last turn's signal.
+    _stopSeenAt = 0;
+    _stopSince = 0;
     editor.focus();
     setTextareaValue(editor, truncateForSend(text));
     if (images && images.length) tagImages(images);
@@ -772,9 +847,10 @@ const ZSProvider = (() => {
     } catch {}
   }
 
-  // /text/* = a fresh chat with no conversation id yet → "" (transient, never
-  // persisted as "started"). A real conversation is /c/<uuid>.
-  const conversationKey = () => (/^\/text\//.test(location.pathname) ? "" : location.pathname);
+  // /text/* (arena.ai) and /c/new (lmarena.ai) = a fresh chat with no
+  // conversation id yet → "" (transient, never persisted as "started"). A real
+  // conversation is /c/<uuid> on both.
+  const conversationKey = () => (isFreshRoute() ? "" : location.pathname);
 
   // ── User-send interception ────────────────────────────────────────────────
   function installSendHooks(handlers) {

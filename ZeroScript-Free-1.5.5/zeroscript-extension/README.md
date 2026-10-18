@@ -18,7 +18,7 @@ It's a Chrome/Edge browser extension plus a small local bridge that connects the
 2. **Open Roblox Studio** and load a Place
 3. **Enable the MCP server in Roblox Studio** (first time only): click **Assistant AI** in the top bar, then **...** > **Manage MCP Servers** > **Enable Studio as MCP Server**
 4. **Run the Bridge** - double-click `start.bat` (Windows) or `MacOS_Start.command` (macOS); a small window opens, the Bridge is running. On macOS, the first launch shows a Gatekeeper warning (normal for any downloaded script): click **Done**, then **System Settings > Privacy & Security**, scroll down, and click **Open Anyway**.
-5. **Go to https://chat.deepseek.com** (recommended), https://chatgpt.com, https://gemini.google.com, https://www.kimi.com, https://chat.z.ai, https://chat.qwen.ai, https://arena.ai, or https://www.meta.ai, open a new chat (only works on these exact addresses; on Arena use Direct mode)
+5. **Go to https://chat.deepseek.com** (recommended), https://chatgpt.com, https://gemini.google.com, https://www.kimi.com, https://chat.z.ai, https://chat.qwen.ai, https://arena.ai (or https://lmarena.ai, the same app under its old name), or https://www.meta.ai, open a new chat (only works on these exact addresses; on Arena use Direct mode)
 6. Click **Start session** in the ZeroScript panel
 7. Type what you want to build
 
@@ -49,8 +49,9 @@ providers/chatgpt.js  same interface for ChatGPT / chatgpt.com (React DOM,
 providers/chatgpt-cm.js MAIN-world CodeMirror tap: republishes each code block's
                       TRUE document (the rendered DOM truncates long
                       lines)                                          (injected by manifest)
-providers/arena.js    same interface for Arena / arena.ai (React DOM, multi-model
-                      playground, A/B-comparison auto-commit, Direct-mode gate) (global ZSProvider)
+providers/arena.js    same interface for Arena / arena.ai and LM Arena / lmarena.ai
+                      (React DOM, multi-model playground, A/B-comparison
+                      auto-commit, Direct-mode gate, Stop-button end of turn) (global ZSProvider)
 providers/meta.js     same interface for Meta AI / meta.ai (React DOM, textarea
                       composer, JSON-viewer + code-collapse masking)   (global ZSProvider)
 background.js         WebSocket to the local bridge (provider-agnostic)
@@ -81,6 +82,21 @@ must stay small enough to type into every session.
 `manifest.json` (`content_scripts` + `host_permissions`) and to
 `PROVIDER_URLS` in `background.js`. No core change required.
 
+**Waiting is the enemy.** The loop never polls a page on a timer: `waitTick()`
+in `core/main.js` resolves on the next DOM *change* (a `MutationObserver`, with
+the old timeout kept only as a ceiling) and `nextPaint()` resolves after the
+next paint (two frames), so "the reply is ready" is noticed the moment it
+happens instead of up to 250ms later. The settle window after a finished reply
+is `SETTLE_MS` in `core/config.js` (250ms; the Arena provider lowers it to
+220ms). A provider that knows the site better than the DOM does can do better
+still: Arena shows a **Stop generation** button for the whole generation and
+swaps it back the instant the model stops, so `providers/arena.js` treats that
+button going away as the end of the turn (after a 60ms beat that covers a
+re-render blinking it out for a frame) - and it still waits while the text is
+growing, so a blink cannot end a turn early. `runBatch()` sends the read-only
+steps of a batch **together** and keeps the writing ones in order, so a batch of
+reads is one round trip instead of sixteen.
+
 Smoke tests (plain Node, no dependencies - run them from this directory):
 
 - `node test-parser.js` - the command parser (`core/parser.js`).
@@ -100,6 +116,10 @@ Smoke tests (plain Node, no dependencies - run them from this directory):
 - `node test-popup.js` - the popup's status panel, run against a stub DOM: the
   connectivity dot must never read green because the always-alive Dev Kit
   answers while Roblox Studio is closed.
+- `node test-fast.js` - the fast paths, run against a stub DOM with a
+  controllable clock: Arena's Stop-button end of turn (including the case where
+  the text is still growing), the lmarena.ai route handling, the DOM-change wait
+  in `core/main.js` (no flat sleeps), and the parallel read-only batch.
 
 All of them print `PASS`/`FAIL` per case and exit non-zero on failure. The
 Bridge and the Dev Kit are covered by Python tests one folder up
