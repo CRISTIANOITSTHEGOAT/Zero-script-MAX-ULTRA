@@ -92,15 +92,18 @@ Go to https://chat.deepseek.com (recommended), https://chatgpt.com, https://gemi
 
 Most of the wait in a session was never the model - it was the tooling around it. That is gone:
 
-| Where the time went | Now |
-|---------------------|-----|
-| The loop polled the page every 120-250ms, so a finished reply was noticed late | It waits for the page to **change** (a DOM observer), so it reacts the moment the answer lands |
-| The send path paused 200ms, and a tab switch back to the AI paused 400ms | A **paint** - two frames - instead of a fixed pause |
-| Arena kept a 1.5s idle window open after every reply | Arena's own **"Stop generation" button** is the end-of-reply signal, so the turn ends at once |
-| `script_write` read the old sources in one call and wrote in another | **One** Studio round trip: the undo snapshot rides along with the write |
-| A batch of 16 reads was 16 round trips, one after the other | Read-only steps go out **together**; writes still run one at a time, in order |
-| A broken build cost the whole play-test window (5-30s) before anyone heard about it | The Output is read **while the place runs**, so the first error ends the test in about a second |
-| Every Output read tried up to four argument spellings | The spelling that worked is **remembered** - one call |
+| Where the time went | Now | Measured |
+|---------------------|-----|----------|
+| The loop polled the page every 120-250ms, so a finished reply was noticed late | It waits for the page to **change** (a DOM observer), so it reacts the moment the answer lands | 760ms -> 250ms after the last token |
+| The send path paused 200ms, and a tab switch back to the AI paused 400ms | A **paint** - two frames - instead of a fixed pause | 200ms / 400ms -> 32ms |
+| Arena kept a 1.5s idle window open after every reply | Arena's own **"Stop generation" button** is the end-of-reply signal, so the turn ends at once | 1500ms -> 60ms after the last token |
+| `script_write` read the old sources in one call and wrote in another | **One** Studio round trip: the undo snapshot rides along with the write | 2 round trips -> 1 |
+| A batch of 16 reads was 16 round trips, one after the other | Read-only steps go out **together**; writes still run one at a time, in order | one wave instead of sixteen |
+| A broken build cost the whole play-test window (5-30s) before anyone heard about it | The Output is read **while the place runs**, so the first error ends the test in about a second | 10.5s -> 1.5s on a 10s window |
+| Every Output read tried up to four argument spellings | The spelling that worked is **remembered** - one call | 3 round trips -> 2 |
+
+(The "measured" column is the old code and the new code run side by side against
+the same fake Studio, with every Studio call modelled as a 120ms round trip.)
 
 ## The Dev Kit
 

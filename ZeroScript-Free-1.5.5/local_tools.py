@@ -2112,42 +2112,56 @@ MEMORY_PATH = "game.ServerStorage.ZeroScript.Memory"
 _CONSOLE_SHAPE = {}
 
 
-def _console(studio, want="both", tail_lines=14, max_chars=2600):
-    """Recent Output from Studio, best effort: the tool's parameter shape has
-    changed between MCP builds, so several are tried.
+def _console_dm(studio, dm, tail_lines=14, max_chars=2600):
+    """ONE datamodel's recent Output -> the report block (or None when Studio
+    does not offer that datamodel). One Studio round trip.
 
     A bare {} is only ever tried for the SERVER, because an argument-less call
     answers with whatever Studio defaults to - accepting that as the Client's
     Output would label one stream as the other (and a playtest report that says
     "Client" while showing Server lines sends the model to fix the wrong side)."""
+    variants = [{"datamodel_type": dm}, {"datamodel": dm}, {"type": dm.lower()}]
+    if dm == "Server":
+        variants.append({})
+    # The shape that worked last time goes first (one round trip, not four).
+    cached = _CONSOLE_SHAPE.get(dm)
+    if cached is not None:
+        variants = [cached] + [v for v in variants if v != cached]
+    ok, text, err, which_idx = studio.tool_which("get_console_output", variants)
+    if ok and which_idx >= 0:
+        _CONSOLE_SHAPE[dm] = variants[which_idx]
+    body = (text or "").strip()
+    if not ok or not body:
+        if err and "not available" in str(err):
+            return None
+        return f"── Output ({dm}) ──\n(unavailable: {str(err or 'empty')[:120]})"
+    lines = body.splitlines()
+    keep = lines[-tail_lines:]
+    text_out = "\n".join(keep)
+    if len(text_out) > max_chars:
+        text_out = text_out[-max_chars:]
+    cut = f"\n…({len(lines) - len(keep)} earlier lines)" if len(lines) > len(keep) else ""
+    noun = "line" if len(keep) == 1 else "lines"
+    return f"── Output ({dm}, last {len(keep)} {noun}) ──\n{text_out}{cut}"
+
+
+def _console(studio, want="both", tail_lines=14, max_chars=2600, server_block=None):
+    """Recent Output from Studio, best effort: the tool's parameter shape has
+    changed between MCP builds, so several are tried (and the shape that
+    worked is remembered, so this is ONE round trip per datamodel).
+
+    server_block lets a caller hand in a Server block it already read, so the
+    same Output is not fetched twice."""
     out = []
     which = {"server": ("Server",), "client": ("Client",), "both": ("Server", "Client")}.get(
         str(want).lower(), ("Server", "Client"))
     for dm in which:
-        variants = [{"datamodel_type": dm}, {"datamodel": dm}, {"type": dm.lower()}]
-        if dm == "Server":
-            variants.append({})
-        # The shape that worked last time goes first (one round trip, not four).
-        cached = _CONSOLE_SHAPE.get(dm)
-        if cached is not None:
-            variants = [cached] + [v for v in variants if v != cached]
-        ok, text, err, which_idx = studio.tool_which("get_console_output", variants)
-        if ok and which_idx >= 0:
-            _CONSOLE_SHAPE[dm] = variants[which_idx]
-        body = (text or "").strip()
-        if not ok or not body:
-            if err and "not available" in str(err):
-                continue
-            out.append(f"── Output ({dm}) ──\n(unavailable: {str(err or 'empty')[:120]})")
+        if dm == "Server" and server_block is not None:
+            out.append(server_block)
             continue
-        lines = body.splitlines()
-        keep = lines[-tail_lines:]
-        text_out = "\n".join(keep)
-        if len(text_out) > max_chars:
-            text_out = text_out[-max_chars:]
-        cut = f"\n…({len(lines) - len(keep)} earlier lines)" if len(lines) > len(keep) else ""
-        noun = "line" if len(keep) == 1 else "lines"
-        out.append(f"── Output ({dm}, last {len(keep)} {noun}) ──\n{text_out}{cut}")
+        block = _console_dm(studio, dm, tail_lines=tail_lines, max_chars=max_chars)
+        if block:
+            out.append(block)
     return "\n\n".join(out)
 
 
@@ -2732,11 +2746,20 @@ def _tool_playtest(args, studio):
     started = text
     ran_for = seconds
     early = ""
+    server_block = None
     if fail_fast and seconds >= 2:
-        # Wait in slices and read the Output as we go (runs in the bridge's
-        # worker thread; the socket keeps answering pings).
+        # Wait in slices and READ THE OUTPUT as we go (runs in the bridge's
+        # worker thread; the socket keeps answering pings). The probe is ONE
+        # Studio call (the Server Output), once a second, and it happens
+        # INSIDE the window the caller asked for - so the play-test still lasts
+        # the same time, it just reports a broken build a second instead of
+        # twenty-five seconds later.
         deadline = time.time() + seconds
         next_check = time.time() + 1.0
+        # The gap between probes grows: a build that is broken breaks in the
+        # first second or two, so the early probes are close together and the
+        # late ones are cheap. A 30s play-test costs 7 probes, not 30.
+        gap = 1.0
         while True:
             left = deadline - time.time()
             if left <= 0:
@@ -2744,16 +2767,20 @@ def _tool_playtest(args, studio):
             time.sleep(min(0.2, left))
             if time.time() < next_check:
                 continue
-            next_check = time.time() + 1.0
+            next_check = time.time() + gap
+            gap = min(4.0, gap * 1.5)
             try:
-                probe = _console(studio, capture, tail_lines=8)
+                block = _console_dm(studio, "Server")
             except ToolError:
                 continue
-            hit = next((ln.strip()[:200] for ln in probe.splitlines()
+            if not block or "unavailable" in block:
+                continue
+            hit = next((ln.strip()[:200] for ln in block.splitlines()
                         if PLAY_ERROR_RE.search(ln) and not PLAY_OK_RE.search(ln)), None)
             if hit:
                 ran_for = max(1, int(seconds - left))
                 early = hit
+                server_block = block
                 break
     else:
         time.sleep(seconds)   # runs in the bridge's worker thread; the socket keeps answering pings
@@ -2776,7 +2803,11 @@ def _tool_playtest(args, studio):
 
     console = ""
     try:
-        console = _console(studio, capture)
+        # The probe's Server snapshot is reused when NOTHING happened since it
+        # was taken (no input was sent) - reading the same Output again would
+        # be a wasted round trip. With input in the mix the Output is read
+        # again, because the input's own lines are only in the fresh read.
+        console = _console(studio, capture, server_block=server_block if not sent_input else None)
     except ToolError as e:
         console = f"── Output ──\n(could not read Output: {str(e).split(chr(10))[0][:140]})"
 
