@@ -16,6 +16,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -158,7 +159,8 @@ class LuauCheckTests(unittest.TestCase):
             (L._LUA_INVENTORY, {"max_depth": 4, "max_nodes": 400, "want_scripts": True,
                                 "want_tree": True, "root": "game"}),
             (L._LUA_READ, {}),
-            (L._LUA_WRITE, {"select": True}),
+            (L._LUA_WRITE, {"select": True, "want_old": True, "old_budget": 24000,
+                            "skip_old": L._lua_skip_set([])}),
             (L._LUA_VERIFY, {"max": 400}),
             (L._LUA_VIEW, {"focus": "game.Workspace.Part", "clear": False}),
         ]
@@ -362,6 +364,7 @@ class DevKitCase(unittest.TestCase):
         L.LAST_OUTPUT_DIR = os.path.join(self.tmp, "last")
         L.INPUT_SETTLE_S = 0   # the real wait is asserted from DEFAULT_INPUT_SETTLE
         L._place_cache.update({"name": None, "at": 0.0})
+        L._CONSOLE_SHAPE.clear()   # the Output argument shape is remembered across calls
         self.fake = FakeStudio(place=self.PLACE, scripts=dict(self.SCRIPTS))
         self.studio = L.Studio(call=self.fake.call, has=self.fake.has)
 
@@ -421,6 +424,20 @@ class OverviewTests(DevKitCase):
     def test_console_output_can_be_skipped(self):
         self.assertNotIn("── Output", run("project_overview", {"console": False}, self.studio))
         self.assertIn("── Output", run("project_overview", {}, self.studio))
+
+    def test_reading_the_output_costs_one_call_once_the_shape_is_known(self):
+        # The Output tool answers to several argument spellings; the one that
+        # worked is remembered, so the second read is ONE Studio call instead
+        # of trying the spellings again. This build only knows "datamodel".
+        L._CONSOLE_SHAPE.clear()
+        self.fake.console_shape = "datamodel"
+        run("project_overview", {"console": True, "capture": "server"}, self.studio)
+        self.assertTrue(L._CONSOLE_SHAPE, "the working argument shape was not remembered")
+        self.fake.calls.clear()
+        run("project_overview", {"console": True, "capture": "server"}, self.studio)
+        # 1 inventory + 1 Output read - not 1 inventory + 2 (one rejected
+        # spelling) + ... : the shape is tried first from now on.
+        self.assertEqual(len(self.fake.calls), 2)
 
     def test_memory_is_recognised_when_it_exists(self):
         self.fake.add_script(L.MEMORY_PATH, "ModuleScript", "return [==[\n# Project memory\n]==]\n")
@@ -488,6 +505,24 @@ class WriteTests(DevKitCase):
         entries = L.history_entries(self.PLACE, "game.ServerScriptService.Main")
         self.assertEqual(len(entries), 1)
         self.assertEqual(L.history_read(entries[0]), 'local Players = game:GetService("Players")\nprint("v1")\n')
+
+    def test_a_write_costs_exactly_one_studio_call(self):
+        # The undo snapshot rides along with the write: the snippet reads the
+        # previous source BEFORE it writes, so there is no second "read the old
+        # sources" round trip, and no separate "what is this place called"
+        # round trip either (every report carries the place name).
+        self.write([{"path": "game.ServerScriptService.Main", "code": 'print("v2")\n'}])
+        self.assertEqual(self.luau_kinds(), ["WRITE"])
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_the_snapshot_is_the_source_from_BEFORE_the_write(self):
+        # The whole point of reading the old source first: the snapshot must be
+        # what the file used to hold, not what it holds now.
+        old = self.fake.source_of("game.ServerScriptService.Main")
+        self.write([{"path": "game.ServerScriptService.Main", "code": 'print("v2")\n'}])
+        entries = L.history_entries(self.PLACE, "game.ServerScriptService.Main")
+        self.assertEqual(L.history_read(entries[0]), old)
+        self.assertNotEqual(L.history_read(entries[0]), 'print("v2")\n')
 
     def test_writing_the_same_content_changes_nothing(self):
         self.write([{"path": "game.ServerScriptService.Main",
@@ -871,6 +906,23 @@ class ViewAndPlaytestTests(DevKitCase):
         text = run("playtest", {"seconds": 1}, self.studio)
         self.assertIn("0 suspicious line(s)", text)
         self.assertIn("Output showed no errors", text)
+
+    def test_the_playtest_stops_early_when_the_output_already_shows_an_error(self):
+        # A build that is already broken used to cost the WHOLE window before
+        # the model heard about it (5s by default, up to 30s). The Output is
+        # read while the place runs, so the first hard error ends the test.
+        self.fake.console = {"Server": ["ERROR: attempt to index nil"], "Client": []}
+        t0 = time.time()
+        text = run("playtest", {"seconds": 8}, self.studio)
+        took = time.time() - t0
+        self.assertIn("stopped early", text)
+        self.assertIn("! ERROR: attempt to index nil", text)
+        self.assertLess(took, 6, "the play-test waited out the whole window")
+
+    def test_the_early_stop_can_be_switched_off(self):
+        self.fake.console = {"Server": ["ERROR: attempt to index nil"], "Client": []}
+        text = run("playtest", {"seconds": 2, "fail_fast": False}, self.studio)
+        self.assertNotIn("stopped early", text)
 
     def test_play_can_be_left_running(self):
         run("playtest", {"seconds": 1, "stop": False}, self.studio)

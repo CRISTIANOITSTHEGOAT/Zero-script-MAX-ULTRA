@@ -999,7 +999,38 @@ _LUA_WRITE = r'''
 local say, finish = zs_out("WRITE")
 local recs = zs_records(@PAYLOAD@)
 local wantSelect = @SELECT@
+local wantOld = @WANT_OLD@
+local oldBudget = @OLD_BUDGET@
 say("PLACE\t" .. tostring(game.Name))
+-- PHASE 1 - read what is about to be overwritten, BEFORE anything is written.
+-- The undo snapshot needs the previous source, and reading it HERE costs NO
+-- extra Studio round trip: it used to be a separate "read the old sources"
+-- call, i.e. one whole extra round trip per write (on top of the write
+-- itself). The capture is bounded, so a big write cannot blow up the reply:
+-- a file past the budget is simply not snapshotted, and the tool says so.
+local old = {}
+if wantOld then
+  local used = 0
+  for _, rec in ipairs(recs) do
+    local inst = zs_find(rec.path)
+    if inst and inst:IsA("LuaSourceContainer") then
+      local okS, src = pcall(function() return inst.Source or "" end)
+      if okS and used + #src <= oldBudget then
+        old[rec.path] = src
+        used = used + #src
+      end
+    end
+  end
+  for _, rec in ipairs(recs) do
+    local src = old[rec.path]
+    if src ~= nil then
+      local enc, data = zs_encode(src)
+      say("OLD\t" .. rec.path .. "\t" .. enc .. "\t" .. #src .. "\t" .. #data)
+      say(data)
+    end
+  end
+end
+-- PHASE 2 - write (and read back, to prove it landed).
 local sel = {}
 for _, rec in ipairs(recs) do
   local inst, err, created = zs_ensure(rec.path, rec.class)
@@ -1008,11 +1039,11 @@ for _, rec in ipairs(recs) do
   elseif not inst:IsA("LuaSourceContainer") then
     say("FAIL\t" .. rec.path .. "\talready exists as a " .. inst.ClassName .. ", not a script - pick another name")
   else
-    local okR, old = pcall(function() return inst.Source or "" end)
+    local okR, cur = pcall(function() return inst.Source or "" end)
     if not okR then
-      say("FAIL\t" .. rec.path .. "\tcannot read the current Source (" .. tostring(old) .. ")")
-    elseif old == rec.code then
-      say("OK\tunchanged\t" .. rec.path .. "\t" .. inst.ClassName .. "\t" .. #old .. "\t" .. #old)
+      say("FAIL\t" .. rec.path .. "\tcannot read the current Source (" .. tostring(cur) .. ")")
+    elseif cur == rec.code then
+      say("OK\tunchanged\t" .. rec.path .. "\t" .. inst.ClassName .. "\t" .. #cur .. "\t" .. #cur)
       sel[#sel + 1] = inst
     else
       local okW, werr = pcall(function() inst.Source = rec.code end)
@@ -1021,7 +1052,7 @@ for _, rec in ipairs(recs) do
       else
         local okB, back = pcall(function() return inst.Source or "" end)
         if okB and back == rec.code then
-          say("OK\t" .. (created and "created" or "updated") .. "\t" .. rec.path .. "\t" .. inst.ClassName .. "\t" .. #old .. "\t" .. #back)
+          say("OK\t" .. (created and "created" or "updated") .. "\t" .. rec.path .. "\t" .. inst.ClassName .. "\t" .. #cur .. "\t" .. #back)
           sel[#sel + 1] = inst
         else
           local got = okB and tostring(#back) or "unreadable"
@@ -1255,18 +1286,25 @@ class Studio:
         """Call an MCP tool trying several argument shapes (Studio's schema has
         moved between builds; a required-param complaint is answered by the next
         variant). Returns (ok, text, error)."""
+        ok, text, err, _idx = self.tool_which(name, variants, timeout)
+        return ok, text, err
+
+    def tool_which(self, name, variants, timeout=STUDIO_TIMEOUT):
+        """Same as tool(), but also reports WHICH variant worked (-1 when none
+        did). The caller can remember it and try that shape first next time -
+        one saved Studio round trip per call."""
         if not self.has(name):
-            return False, "", f"'{name}' is not available in this Studio MCP build"
+            return False, "", f"'{name}' is not available in this Studio MCP build", -1
         last = ""
-        for args in variants:
+        for i, args in enumerate(variants):
             r = self.call(name, args, timeout)
             text = (r.get("text") or "").strip()
             if r.get("ok") and not re.match(r"^[\w .'\"-]{0,60}\bis (required|not available|invalid)\b", text):
                 if _NO_STUDIO_RE.search(text):
                     raise ToolError(NO_STUDIO_HINT)
-                return True, text, None
+                return True, text, None, i
             last = r.get("error") or text or "unknown failure"
-        return False, "", last
+        return False, "", last, -1
 
 
 # ── report parsing ─────────────────────────────────────────────────────────
@@ -1685,15 +1723,127 @@ def _chunks_by_bytes(files, max_bytes):
     return groups
 
 
-def _write_via_luau(studio, files, select=False, timeout=STUDIO_TIMEOUT):
-    """Returns (results, hard_error). results: one dict per file with
-    status/path/old/new. A payload Studio refuses to parse is halved and retried
-    once, then reported so the multi_edit fallback can take over."""
+def _lua_skip_set(paths):
+    """A Luau set literal ({["a.b"]=true}) of the paths a retried write must
+    NOT capture again. The old source of a file is read BEFORE it is written,
+    so a path we already captured must never be read again after a write - the
+    second read would return the NEW source and the undo snapshot would be a
+    lie."""
+    items = []
+    for p in paths or ():
+        p = str(p or "")
+        if p and re.match(r"^[A-Za-z0-9_.]+$", p):
+            items.append(f'["{p}"]=true')
+    return "{" + ",".join(items) + "}"
+
+
+def _parse_write_old(text):
+    """The OLD block of a ZS-WRITE report -> {path: previous source}.
+
+    Tolerant on purpose: the OLD block comes FIRST in the report, so even a
+    reply that was cut short later still carries the undo snapshots - and
+    those are the one thing that cannot be recovered afterwards (the file has
+    already been overwritten)."""
+    data = (text or "").encode("utf-8", "replace")
+    idx = data.find(b"ZS-WRITE 1")
+    if idx == -1:
+        return {}
+    pos = idx + len(b"ZS-WRITE 1")
+    end = data.find(b"\nEND", pos)
+    stop = end if end != -1 else len(data)
+    out = {}
+
+    def read_line(p):
+        e = data.find(b"\n", p)
+        if e == -1 or e > stop:
+            e = stop
+        return data[p:e].decode("utf-8", "replace"), e + 1
+
+    while pos < stop:
+        line, nxt = read_line(pos)
+        pos = nxt
+        if not line.strip() or line == "END":
+            continue
+        parts = line.split("\t")
+        if parts[0] != "OLD" or len(parts) < 5:
+            continue
+        path, enc, data_len = parts[1], parts[2], parts[4]
+        try:
+            n = int(data_len)
+        except ValueError:
+            n = 0
+        blob = data[pos:pos + n]
+        pos += n
+        if data[pos:pos + 1] == b"\n":
+            pos += 1
+        try:
+            raw = base64.b64decode(blob, validate=True) if enc == "B64" else blob
+            out[path] = raw.decode("utf-8")
+        except Exception:  # noqa: BLE001 - an undecodable snapshot is just no snapshot
+            continue
+    return out
+
+
+def _parse_write_place(text):
+    """The place name out of a ZS-WRITE report (the snippet reports the place
+    it wrote into). The undo history lives in a per-place folder, so the name
+    is needed for EVERY write - and it rides along with the write report, so
+    asking Studio for it separately would be a wasted round trip."""
+    raw = text or ""
+    head = "ZS-WRITE 1"
+    idx = raw.find(head)
+    if idx == -1:
+        return None
+    body = raw[idx + len(head):]
+    for ln in body.split("\n"):
+        ln = ln.strip("\r")
+        if not ln.strip():
+            continue
+        parts = ln.split("\t")
+        if parts[0] == "PLACE" and len(parts) > 1 and parts[1].strip():
+            return parts[1].strip()
+        break   # the PLACE line is the FIRST line of the report
+    return None
+
+
+def _parse_write_ok(text):
+    """The OK lines of a ZS-WRITE report -> {path: status}. Salvaged from a
+    reply that was cut short, so a retried write knows what an earlier
+    attempt already wrote."""
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if parts[0] == "OK" and len(parts) >= 3:
+            out[parts[2]] = parts[1]
+    return out
+
+
+def _write_report_truncated(text):
+    """True when Studio's WRITE reply has no END marker - the reply was cut
+    short (too big for the transport). The write may be half done, so the
+    chunk has to be retried in smaller pieces."""
+    t = text or ""
+    if "ZS-WRITE 1" not in t:
+        return False
+    return "\nEND" not in t
+
+
+def _write_via_luau(studio, files, select=False, timeout=STUDIO_TIMEOUT, want_old=True):
+    """Returns (results, hard_error, old_sources). results: one dict per file
+    with status/path/old/new. A payload Studio refuses to parse is halved and
+    retried once, then reported so the multi_edit fallback can take over.
+
+    The whole write is ONE Studio round trip: the snippet reads the previous
+    source of every file it is about to overwrite BEFORE it writes, so the
+    undo snapshots come back with the write. It used to cost a second round
+    trip (a separate "read the old sources" call) on top of the write."""
     # Chunk up front: Studio's parser has a size limit (documented live in
     # CHANGELOG.md), and a 40-file system must not ride on one giant call. A
     # chunk that is still refused is halved again below.
     groups = _chunks_by_bytes(files, MAX_WRITE_BYTES)
     results = []
+    old_sources = {}
+    written = {}
     # Selection is one Studio-wide state, so only the LAST chunk sets it -
     # otherwise each chunk would deselect the previous one's scripts.
     queue = [(g, bool(select) and i == len(groups) - 1) for i, g in enumerate(groups)]
@@ -1701,9 +1851,47 @@ def _write_via_luau(studio, files, select=False, timeout=STUDIO_TIMEOUT):
     while queue:
         group, sel = queue.pop(0)
         payload = _pack_records(group)
-        code = _snippet("WRITE", _LUA_WRITE, payload=payload, select=sel)
+        code = _snippet("WRITE", _LUA_WRITE, payload=payload, select=sel,
+                        want_old=want_old, old_budget=MAX_WRITE_BYTES,
+                        skip_old=_lua_skip_set(list(old_sources) + list(written)))
         try:
             text = studio.luau(code, timeout=timeout)
+        except ToolError as e:
+            # Studio being unreachable is an ENVIRONMENT problem, not a failed
+            # file: it must reach the model as one clear error (so it tells
+            # the user to open Studio) and not as N per-file failures.
+            if getattr(e, "args", None) and e.args[0] is NO_STUDIO_HINT:
+                raise
+            if len(group) > 1 and _SIZE_PROBLEM_RE.search(str(e)):
+                mid = len(group) // 2
+                queue.insert(0, (group[mid:], False))
+                queue.insert(0, (group[:mid], sel))
+                continue
+            hard = str(e)
+            for f in group:
+                results.append({"status": "failed", "path": f["path"], "class": f["class"],
+                                "reason": hard.split("\n")[0][:200]})
+            continue
+        # Salvage what the reply carries BEFORE parsing it: the OLD block
+        # comes first, so a reply that was cut short still holds the undo
+        # snapshots, and the OK lines tell us what an earlier attempt wrote.
+        old_sources.update(_parse_write_old(text))
+        written.update(_parse_write_ok(text))
+        # The report says which place it wrote into - remember it, so the
+        # history folder and the report do not cost a second round trip.
+        _name = _parse_write_place(text)
+        if _name:
+            with _lock:
+                _note_place(_name)
+        if _write_report_truncated(text) and len(group) > 1:
+            # The reply was cut short - the chunk is too big for the transport.
+            # Halve it and retry; the salvaged snapshots and the "already
+            # written" set carry over, so the retry stays correct.
+            mid = len(group) // 2
+            queue.insert(0, (group[mid:], False))
+            queue.insert(0, (group[:mid], sel))
+            continue
+        try:
             lines = parse_report(text, "WRITE")
         except ToolError as e:
             if len(group) > 1 and _SIZE_PROBLEM_RE.search(str(e)):
@@ -1731,6 +1919,15 @@ def _write_via_luau(studio, files, select=False, timeout=STUDIO_TIMEOUT):
         for f in group:
             got = by_path.get(f["path"])
             if got:
+                # A retried chunk re-writes what an earlier attempt already
+                # wrote, so the site reports "unchanged". The snapshot we hold
+                # is the truth: it was read before anything was written.
+                prev = old_sources.get(f["path"])
+                if got["status"] == "unchanged":
+                    if prev is not None and prev != f["code"]:
+                        got["status"] = "updated"
+                    elif f["path"] in written and written[f["path"]] != "unchanged":
+                        got["status"] = written[f["path"]]
                 results.append(got)
             else:
                 results.append({"status": "failed", "path": f["path"], "class": f["class"],
@@ -1739,7 +1936,7 @@ def _write_via_luau(studio, files, select=False, timeout=STUDIO_TIMEOUT):
         if sel_n:
             for r in results[-len(group):]:
                 r["selected"] = True
-    return results, hard
+    return results, hard, old_sources
 
 
 def _write_via_multi_edit(studio, files, old_sources, timeout=STUDIO_TIMEOUT):
@@ -1794,27 +1991,38 @@ def write_scripts(studio, files, history=True, check=True, force=False,
             return {"results": [], "blocked": "\n".join(lines), "history_error": None,
                     "hard": None, "slug": None}
 
-    slug = place_slug(studio)
-    old_sources = {}
-    if history:
+    # ONE Studio round trip for the whole write. The snippet reads the
+    # previous source of every file it overwrites BEFORE it writes, so the
+    # undo snapshots come back with the write itself - the separate "read the
+    # old sources" call this used to make was a whole extra round trip per
+    # write, on every write, for nothing.
+    results, hard, old_sources = _write_via_luau(
+        studio, files, select=select and len(files) <= 20, timeout=timeout,
+        want_old=bool(history))
+    # The place name rides along with every Dev Kit report, so where the undo
+    # history lives costs no extra round trip either.
+    # The place name came back with the write report (see _parse_write_place),
+    # so the history folder is known without a second round trip. A STALE
+    # cache entry (older than place_slug's window) is not trusted: the user
+    # may have opened another place since.
+    name = _place_cache.get("name")
+    fresh = bool(name) and (time.time() - _place_cache.get("at", 0.0)) < 180.0
+    if fresh:
+        slug = _slug(name)
+    else:
         try:
-            got, _miss = read_sources(studio, [f["path"] for f in files], timeout=timeout)
-            old_sources = {g["path"]: g["code"] for g in got}
-            classes = {g["path"]: g["class"] for g in got}
-            for f in files:
-                if f["path"] in classes and classes[f["path"]] in SCRIPT_CLASSES:
-                    f["found_class"] = classes[f["path"]]
-        except ToolError as e:
-            # History is a safety net, not a precondition: if reading the old
-            # sources fails, still write (the user's request wins) and say so.
-            old_sources = {}
-            history_error = str(e).split("\n")[0][:160]
-        else:
-            history_error = None
+            slug = place_slug(studio)
+        except ToolError:
+            slug = "place"
+    if history:
+        missing = [r["path"] for r in results
+                   if r["status"] == "updated" and r["path"] not in old_sources]
+        history_error = None
+        if missing:
+            history_error = (f"{len(missing)} file(s) were too large to snapshot before the write "
+                             f"(e.g. {missing[0]}) - script_history cannot undo those")
     else:
         history_error = None
-
-    results, hard = _write_via_luau(studio, files, select=select and len(files) <= 20, timeout=timeout)
 
     # Retry the failures through multi_edit when the reason looks like a write
     # permission/transport problem rather than a bad path.
@@ -1896,36 +2104,64 @@ def format_write(results, blocked=None, history_error=None, hard=None, slug=None
 MEMORY_PATH = "game.ServerStorage.ZeroScript.Memory"
 
 
-def _console(studio, want="both", tail_lines=14, max_chars=2600):
-    """Recent Output from Studio, best effort: the tool's parameter shape has
-    changed between MCP builds, so several are tried.
+# The argument shape get_console_output answered to last time, per datamodel.
+# Studio's schema does not change between calls, so the shape that worked is
+# tried FIRST: the Output read costs ONE Studio round trip instead of up to
+# FOUR (one per rejected spelling) - and project_overview/playtest read the
+# Output on every single call.
+_CONSOLE_SHAPE = {}
+
+
+def _console_dm(studio, dm, tail_lines=14, max_chars=2600):
+    """ONE datamodel's recent Output -> the report block (or None when Studio
+    does not offer that datamodel). One Studio round trip.
 
     A bare {} is only ever tried for the SERVER, because an argument-less call
     answers with whatever Studio defaults to - accepting that as the Client's
     Output would label one stream as the other (and a playtest report that says
     "Client" while showing Server lines sends the model to fix the wrong side)."""
+    variants = [{"datamodel_type": dm}, {"datamodel": dm}, {"type": dm.lower()}]
+    if dm == "Server":
+        variants.append({})
+    # The shape that worked last time goes first (one round trip, not four).
+    cached = _CONSOLE_SHAPE.get(dm)
+    if cached is not None:
+        variants = [cached] + [v for v in variants if v != cached]
+    ok, text, err, which_idx = studio.tool_which("get_console_output", variants)
+    if ok and which_idx >= 0:
+        _CONSOLE_SHAPE[dm] = variants[which_idx]
+    body = (text or "").strip()
+    if not ok or not body:
+        if err and "not available" in str(err):
+            return None
+        return f"── Output ({dm}) ──\n(unavailable: {str(err or 'empty')[:120]})"
+    lines = body.splitlines()
+    keep = lines[-tail_lines:]
+    text_out = "\n".join(keep)
+    if len(text_out) > max_chars:
+        text_out = text_out[-max_chars:]
+    cut = f"\n…({len(lines) - len(keep)} earlier lines)" if len(lines) > len(keep) else ""
+    noun = "line" if len(keep) == 1 else "lines"
+    return f"── Output ({dm}, last {len(keep)} {noun}) ──\n{text_out}{cut}"
+
+
+def _console(studio, want="both", tail_lines=14, max_chars=2600, server_block=None):
+    """Recent Output from Studio, best effort: the tool's parameter shape has
+    changed between MCP builds, so several are tried (and the shape that
+    worked is remembered, so this is ONE round trip per datamodel).
+
+    server_block lets a caller hand in a Server block it already read, so the
+    same Output is not fetched twice."""
     out = []
     which = {"server": ("Server",), "client": ("Client",), "both": ("Server", "Client")}.get(
         str(want).lower(), ("Server", "Client"))
     for dm in which:
-        variants = [{"datamodel_type": dm}, {"datamodel": dm}, {"type": dm.lower()}]
-        if dm == "Server":
-            variants.append({})
-        ok, text, err = studio.tool("get_console_output", variants)
-        body = (text or "").strip()
-        if not ok or not body:
-            if err and "not available" in str(err):
-                continue
-            out.append(f"── Output ({dm}) ──\n(unavailable: {str(err or 'empty')[:120]})")
+        if dm == "Server" and server_block is not None:
+            out.append(server_block)
             continue
-        lines = body.splitlines()
-        keep = lines[-tail_lines:]
-        text_out = "\n".join(keep)
-        if len(text_out) > max_chars:
-            text_out = text_out[-max_chars:]
-        cut = f"\n…({len(lines) - len(keep)} earlier lines)" if len(lines) > len(keep) else ""
-        noun = "line" if len(keep) == 1 else "lines"
-        out.append(f"── Output ({dm}, last {len(keep)} {noun}) ──\n{text_out}{cut}")
+        block = _console_dm(studio, dm, tail_lines=tail_lines, max_chars=max_chars)
+        if block:
+            out.append(block)
     return "\n\n".join(out)
 
 
@@ -2498,14 +2734,60 @@ def _tool_playtest(args, studio):
     capture = str(args.get("capture") or "both").lower()
     if capture not in ("server", "client", "both"):
         capture = "both"
+    # Stop the play-test as soon as the Output shows a hard error instead of
+    # always waiting out the full time. A build that is already broken used to
+    # cost the whole window (5s by default, up to 30s) before the model heard
+    # about it; now it is reported in about a second.
+    fail_fast = _as_bool(args.get("fail_fast"), True)
     ok, text, err = studio.tool("start_stop_play", [{"is_start": True}])
     if not ok:
         raise ToolError(f"could not start play-testing: {err or text or 'start_stop_play refused'}. "
                         f"Studio may already be playing - try again with \"stop\": true, or check get_studio_state.")
     started = text
-    time.sleep(seconds)   # runs in the bridge's worker thread; the socket keeps answering pings
+    ran_for = seconds
+    early = ""
+    server_block = None
+    if fail_fast and seconds >= 2:
+        # Wait in slices and READ THE OUTPUT as we go (runs in the bridge's
+        # worker thread; the socket keeps answering pings). The probe is ONE
+        # Studio call (the Server Output), once a second, and it happens
+        # INSIDE the window the caller asked for - so the play-test still lasts
+        # the same time, it just reports a broken build a second instead of
+        # twenty-five seconds later.
+        deadline = time.time() + seconds
+        next_check = time.time() + 1.0
+        # The gap between probes grows: a build that is broken breaks in the
+        # first second or two, so the early probes are close together and the
+        # late ones are cheap. A 30s play-test costs 7 probes, not 30.
+        gap = 1.0
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            time.sleep(min(0.2, left))
+            if time.time() < next_check:
+                continue
+            next_check = time.time() + gap
+            gap = min(4.0, gap * 1.5)
+            try:
+                block = _console_dm(studio, "Server")
+            except ToolError:
+                continue
+            if not block or "unavailable" in block:
+                continue
+            hit = next((ln.strip()[:200] for ln in block.splitlines()
+                        if PLAY_ERROR_RE.search(ln) and not PLAY_OK_RE.search(ln)), None)
+            if hit:
+                ran_for = max(1, int(seconds - left))
+                early = hit
+                server_block = block
+                break
+    else:
+        time.sleep(seconds)   # runs in the bridge's worker thread; the socket keeps answering pings
 
     notes = []
+    if early:
+        notes.append(f"stopped early after {ran_for}s - the Output already showed an error")
     sent_input = False
     for kind, key in (("keyboard", "keys"), ("mouse", "mouse")):
         actions = args.get(key)
@@ -2521,7 +2803,11 @@ def _tool_playtest(args, studio):
 
     console = ""
     try:
-        console = _console(studio, capture)
+        # The probe's Server snapshot is reused when NOTHING happened since it
+        # was taken (no input was sent) - reading the same Output again would
+        # be a wasted round trip. With input in the mix the Output is read
+        # again, because the input's own lines are only in the fresh read.
+        console = _console(studio, capture, server_block=server_block if not sent_input else None)
     except ToolError as e:
         console = f"── Output ──\n(could not read Output: {str(e).split(chr(10))[0][:140]})"
 
@@ -2532,7 +2818,7 @@ def _tool_playtest(args, studio):
 
     body = [ln for ln in console.splitlines() if ln.strip()]
     problems = [ln.strip()[:200] for ln in body if PLAY_ERROR_RE.search(ln) and not PLAY_OK_RE.search(ln)]
-    head = (f"playtest: play-tested for {seconds}s in Studio"
+    head = (f"playtest: play-tested for {ran_for}s in Studio"
             + (f", {stopped}" if stopped else ", left RUNNING")
             + f" - {len(problems)} suspicious line(s) in Output.")
     out = [head]
@@ -2730,6 +3016,8 @@ LOCAL_TOOLS = [
                 "seconds": dict(_N, description="Seconds to run (1-30). Default 5."),
                 "stop": dict(_B, description="Stop play-testing after. Default true."),
                 "capture": dict(_S, description="server|client|both. Default both."),
+                "fail_fast": dict(_B, description="Stop at the first error in the Output instead of "
+                                                   "running the whole window. Default true."),
                 # The action objects are forwarded to Studio's user_keyboard_input /
                 # user_mouse_input verbatim, so their vocabularies are spelled out
                 # here: an item schema of just {action: string} is what makes a

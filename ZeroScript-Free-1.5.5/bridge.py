@@ -94,6 +94,12 @@ HOST = "127.0.0.1"
 # startup so a user's terminal output alone tells us which build they're on.
 BRIDGE_VERSION = "1.6.0"
 PORT = int(os.environ.get("ZS_BRIDGE_PORT", "17613"))
+# How many tool calls may be in flight to ONE MCP server at the same time. A
+# batch of read-only commands (project_overview, script_read, luau_check, ...)
+# is fired in parallel by the extension; this is how many of those requests may
+# be on the wire together. Four is plenty to turn a 16-step batch from 16 round
+# trips into ~4, without flooding the server.
+MAX_CONCURRENT_CALLS = 4
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Both paths can be redirected (used by the test suite so it never touches your
 # real config.json or logs). Normal users never set these.
@@ -818,7 +824,15 @@ class MCPClient:
         self.proc = None
         self.req_id = 1
         self.write_lock = threading.Lock()
-        self.call_lock = threading.Lock()   # serialize tool calls (single stdio pipe)
+        # Tool calls are NOT serialized any more. The old single lock made every
+        # call wait for the previous one to finish, so a batch of N read-only
+        # commands cost N round trips back to back - pure waiting. The JSON-RPC
+        # layer is already safe for concurrent requests (every request carries
+        # its own id and the reader hands each reply to the right waiter), so
+        # the calls now overlap and the batch finishes in roughly ONE round
+        # trip. The cap keeps a big batch from flooding the server.
+        self.call_lock = threading.Lock()   # only the RESTART path is exclusive
+        self.call_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CALLS)
         self.pending = {}                    # id -> queue.Queue (one slot)
         self.pend_lock = threading.Lock()
         self.tools_cache = []
@@ -1085,16 +1099,37 @@ class MCPClient:
         return self.tools_cache
 
     def call_tool(self, name, arguments, timeout):
-        """Returns {"text":..., "images":[...]}. Raises on error/timeout."""
-        with self.call_lock:
+        """Returns {"text":..., "images":[...]}. Raises on error/timeout.
+
+        Concurrent calls are allowed (see call_slots): the JSON-RPC layer
+        matches every reply to its own request, so several calls can be on the
+        wire at once and a parallel batch of reads costs ONE round trip
+        instead of N. Only the RESTART path is exclusive - two threads must
+        never spawn two servers at the same time."""
+        try:
+            slot_timeout = max(1.0, min(float(timeout or 30), 60.0))
+        except (TypeError, ValueError):
+            slot_timeout = 30.0
+        acquired = self.call_slots.acquire(timeout=slot_timeout)
+        if not acquired:
+            # The cap is SOFT: a saturated server must never fail a call, it
+            # just runs one over the cap (and the caller still has its own
+            # timeout behind it).
+            log(f"[{self.id}] all {MAX_CONCURRENT_CALLS} call slots busy - running over the cap",
+                "y", terminal=False)
+        try:
             for attempt in (1, 2):
                 if not self.is_alive():
-                    self.restart()
+                    with self.call_lock:
+                        if not self.is_alive():
+                            self.restart()
                 msg = self._request("tools/call",
                                     {"name": name, "arguments": arguments}, timeout)
                 if msg is None:
                     if not self.is_alive():
-                        self.restart()
+                        with self.call_lock:
+                            if not self.is_alive():
+                                self.restart()
                         msg = self._request("tools/call",
                                             {"name": name, "arguments": arguments}, timeout)
                     if msg is None:
@@ -1127,6 +1162,12 @@ class MCPClient:
                     time.sleep(1.5)
                     continue
                 return {"text": text, "images": images}
+        finally:
+            if acquired:
+                try:
+                    self.call_slots.release()
+                except ValueError:
+                    pass
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1180,6 +1221,10 @@ class MCPHttpClient(MCPClient):
         self.session_id = None
         self.protocol_version = self.PROTOCOL_VERSION
         self._connected = False  # handshake done and the server has not gone away
+        # Tool calls may now run in parallel, so a session that the server
+        # forgot has to be re-created by ONE thread - not by every thread that
+        # happens to hit the 404 at the same moment.
+        self.session_lock = threading.Lock()
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     def is_alive(self):
@@ -1330,15 +1375,16 @@ class MCPHttpClient(MCPClient):
                 return msg
             except _SessionExpired as e:
                 log(f"[{self.id}] server forgot the session ({e}) - reconnecting", "yl", terminal=False)
-                self._connected = False
-                self.session_id = None
-                if attempt == 2:
-                    raise RuntimeError(f"server '{self.id}' rejected a fresh session too: {e}")
-                try:
-                    self.start()
-                except Exception as e2:
-                    raise RuntimeError(f"server '{self.id}' forgot its session and could not "
-                                       f"reconnect: {e2}")
+                with self.session_lock:
+                    self._connected = False
+                    self.session_id = None
+                    if attempt == 2:
+                        raise RuntimeError(f"server '{self.id}' rejected a fresh session too: {e}")
+                    try:
+                        self.start()
+                    except Exception as e2:
+                        raise RuntimeError(f"server '{self.id}' forgot its session and could not "
+                                           f"reconnect: {e2}")
             except (TimeoutError, socket.timeout):
                 return None  # slow, not dead: keep the session, the caller decides
             except urllib.error.URLError as e:
@@ -1583,7 +1629,9 @@ def _probe_tool_text(tool):
         return None
     holder, real_name = entry
     # Never queue behind a long-running tool call (the probe is best-effort).
-    if not holder.call_lock.acquire(blocking=False):
+    # The call slots - not the restart lock - are what says "the server is
+    # busy": they are taken for the whole duration of a tool call.
+    if not holder.call_slots.acquire(blocking=False):
         return None
     try:
         if not holder.is_alive():
@@ -1596,7 +1644,10 @@ def _probe_tool_text(tool):
     except Exception:
         return None
     finally:
-        holder.call_lock.release()
+        try:
+            holder.call_slots.release()
+        except ValueError:
+            pass
 
 
 _studio_cache = {"at": 0.0, "value": None}
