@@ -98,7 +98,7 @@ Most of the wait in a session was never the model - it was the tooling around it
 | The send path paused 200ms, and a tab switch back to the AI paused 400ms | A **paint** - two frames - instead of a fixed pause | 200ms / 400ms -> 32ms |
 | Arena kept a 1.5s idle window open after every reply | Arena's own **"Stop generation" button** is the end-of-reply signal, so the turn ends at once | 1500ms -> 60ms after the last token |
 | `script_write` read the old sources in one call and wrote in another | **One** Studio round trip: the undo snapshot rides along with the write | 2 round trips -> 1 |
-| A batch of 16 reads was 16 round trips, one after the other | Read-only steps go out **together**; writes still run one at a time, in order | one wave instead of sixteen |
+| A batch of 16 reads was 16 round trips, one after the other | Read-only steps are **sent together** (and the Bridge lets up to 4 Studio calls overlap); writes still run one at a time, in order | the steps leave together, not one after the other |
 | A broken build cost the whole play-test window (5-30s) before anyone heard about it | The Output is read **while the place runs**, so the first error ends the test in about a second | 10.5s -> 1.5s on a 10s window |
 | Every Output read tried up to four argument spellings | The spelling that worked is **remembered** - one call | 3 round trips -> 2 |
 
